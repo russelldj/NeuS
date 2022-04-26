@@ -375,7 +375,20 @@ class NeuSRenderer:
         perturb_overwrite=-1,
         background_rgb=None,
         cos_anneal_ratio=0.0,
+        sdf_network=None,
+        color_network=None,
+        deviation_network=None,
     ):
+        # Allow these networks to be overridden
+        if sdf_network is None:
+            sdf_network = self.sdf_network
+
+        if color_network is None:
+            color_network = self.color_network
+        
+        if deviation_network is None:
+            deviation_network = self.deviation_network
+
         batch_size = len(rays_o)
         sample_dist = (
             2.0 / self.n_samples
@@ -417,7 +430,7 @@ class NeuSRenderer:
         if self.n_importance > 0:
             with torch.no_grad():
                 pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(
+                sdf = sdf_network.sdf(pts.reshape(-1, 3)).reshape(
                     batch_size, self.n_samples
                 )
 
@@ -458,9 +471,9 @@ class NeuSRenderer:
             rays_d,
             z_vals,
             sample_dist,
-            self.sdf_network,
-            self.deviation_network,
-            self.color_network,
+            sdf_network,
+            deviation_network,
+            color_network,
             background_rgb=background_rgb,
             background_alpha=background_alpha,
             background_sampled_color=background_sampled_color,

@@ -107,6 +107,154 @@ class Runner:
         if self.mode[:5] == "train":
             self.file_backup()
 
+    def do_base_learning(self, dataset, lr_inner, n_inner):
+        """
+        Inspired by https://github.com/gabrielhuang/reptile-pytorch/blob/master/reptile_sine.ipynb
+        """
+        renderer = NeuSRenderer(
+            self.nerf_outside,
+            self.sdf_network,
+            self.deviation_network,
+            self.color_network,
+            **self.conf["model.neus_renderer"]
+        )
+        # TODO update this
+        nerf_outside = NeRF(**self.conf["model.nerf"]).to(self.device)
+        sdf_network = SDFNetwork(**self.conf["model.sdf_network"]).to(self.device)
+        deviation_network = SingleVarianceNetwork(
+            **self.conf["model.variance_network"]
+        ).to(self.device)
+        color_network = RenderingNetwork(**self.conf["model.rendering_network"]).to(
+            self.device
+        )
+
+        # TODO load all the parameters from the original models
+
+        params_to_train = []
+        params_to_train += list(nerf_outside.parameters())
+        params_to_train += list(sdf_network.parameters())
+        params_to_train += list(deviation_network.parameters())
+        params_to_train += list(color_network.parameters())
+        optimizer = torch.optim.Adam(params_to_train, lr=lr_inner)
+
+        image_perm = self.get_image_perm()
+
+        iter_step = 0
+        # Needs to create a new model
+        # Needs to be given the current model
+        for iter_i in tqdm(range(n_inner)):
+            data = dataset.gen_random_rays_at(
+                image_perm[self.iter_step % len(image_perm)], self.batch_size
+            )
+
+            rays_o, rays_d, true_rgb, mask = (
+                data[:, :3],
+                data[:, 3:6],
+                data[:, 6:9],
+                data[:, 9:10],
+            )
+            near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+
+            background_rgb = None
+            if self.use_white_bkgd:
+                background_rgb = torch.ones([1, 3])
+
+            if self.mask_weight > 0.0:
+                mask = (mask > 0.5).float()
+            else:
+                mask = torch.ones_like(mask)
+
+            mask_sum = mask.sum() + 1e-5
+            # This render uses the new models we just created
+            render_out = renderer.render(
+                rays_o,
+                rays_d,
+                near,
+                far,
+                background_rgb=background_rgb,
+                cos_anneal_ratio=self.get_cos_anneal_ratio(),
+            )
+
+            color_fine = render_out["color_fine"]
+            # s_val = render_out["s_val"]
+            # cdf_fine = render_out["cdf_fine"]
+            gradient_error = render_out["gradient_error"]
+            # weight_max = render_out["weight_max"]
+            weight_sum = render_out["weight_sum"]
+
+            # Loss
+            color_error = (color_fine - true_rgb) * mask
+            color_fine_loss = (
+                F.l1_loss(color_error, torch.zeros_like(color_error), reduction="sum")
+                / mask_sum
+            )
+            # psnr = 20.0 * torch.log10(
+            #    1.0
+            #    / (
+            #        ((color_fine - true_rgb) ** 2 * mask).sum() / (mask_sum * 3.0)
+            #    ).sqrt()
+            # )
+
+            eikonal_loss = gradient_error
+
+            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+
+            loss = (
+                color_fine_loss
+                + eikonal_loss * self.igr_weight
+                + mask_loss * self.mask_weight
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            self.iter_step += 1
+            if iter_step % len(image_perm) == 0:
+                image_perm = self.get_image_perm()
+
+            # self.writer.add_scalar("Loss/loss", loss, self.iter_step)
+            # self.writer.add_scalar("Loss/color_loss", color_fine_loss, self.iter_step)
+            # self.writer.add_scalar("Loss/eikonal_loss", eikonal_loss, self.iter_step)
+            # self.writer.add_scalar("Statistics/s_val", s_val.mean(), self.iter_step)
+            # self.writer.add_scalar(
+            #    "Statistics/cdf",
+            #    (cdf_fine[:, :1] * mask).sum() / mask_sum,
+            #    self.iter_step,
+            # )
+            # self.writer.add_scalar(
+            #    "Statistics/weight_max",
+            #    (weight_max * mask).sum() / mask_sum,
+            #    self.iter_step,
+            # )
+            # self.writer.add_scalar("Statistics/psnr", psnr, self.iter_step)
+
+            # if self.iter_step % self.report_freq == 0:
+            #    print(self.base_exp_dir)
+            #    print(
+            #        "iter:{:8>d} loss = {} lr={}".format(
+            #            self.iter_step, loss, self.optimizer.param_groups[0]["lr"]
+            #        )
+            #    )
+
+            # if self.iter_step % self.save_freq == 0:
+            #    self.save_checkpoint()
+
+            # if self.iter_step % self.val_freq == 0:
+            #    self.validate_image()
+
+            # if self.iter_step % self.val_mesh_freq == 0:
+            #    self.validate_mesh()
+
+            # self.update_learning_rate()
+
+    def train_reptile(self):
+        # TODO this needs multiple datasets
+        self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, "logs"))
+        self.update_learning_rate()
+        res_step = self.end_iter - self.iter_step
+        image_perm = self.get_image_perm()
+
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, "logs"))
         self.update_learning_rate()
